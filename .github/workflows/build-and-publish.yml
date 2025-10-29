@@ -6,6 +6,8 @@ on:
     - cron: '0 6 * * *' # daily at 06:00 UTC
   push:
     branches: [ main ]
+  pull_request:
+    branches: [ main ]
 
 env:
   IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/syncribullet
@@ -15,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      packages: write
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
@@ -26,44 +29,78 @@ jobs:
           path: upstream
           fetch-depth: 0
 
-      - name: Get upstream commit short SHA
-        id: upstream_sha
+      - name: Get upstream commit info
+        id: upstream_info
         run: |
-          echo "sha=$(git -C upstream rev-parse --short=12 HEAD)" >> $GITHUB_OUTPUT
+          cd upstream
+          echo "sha=$(git rev-parse --short=12 HEAD)" >> $GITHUB_OUTPUT
+          echo "full_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "date=$(date -u +'%Y%m%d')" >> $GITHUB_OUTPUT
+          echo "isodate=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
 
-      - name: Write Dockerfile (static build via Vite/Qwik)
+      - name: Write Dockerfile with optimizations
         working-directory: upstream
         run: |
           cat > Dockerfile <<'EOF'
           FROM node:20-alpine AS build
           WORKDIR /app
+          
+          # Copy package files for better layer caching
           COPY package*.json ./
-          RUN npm ci
+          
+          # Install dependencies with cache mount
+          RUN --mount=type=cache,target=/root/.npm \
+              npm ci --prefer-offline --no-audit
+          
+          # Copy source and build
           COPY . .
           RUN npm run build
 
           FROM nginx:alpine
+          
+          # Add nginx config for SPA routing
+          RUN echo 'server {' > /etc/nginx/conf.d/default.conf && \
+              echo '    listen 80;' >> /etc/nginx/conf.d/default.conf && \
+              echo '    server_name _;' >> /etc/nginx/conf.d/default.conf && \
+              echo '    root /usr/share/nginx/html;' >> /etc/nginx/conf.d/default.conf && \
+              echo '    index index.html;' >> /etc/nginx/conf.d/default.conf && \
+              echo '    location / {' >> /etc/nginx/conf.d/default.conf && \
+              echo '        try_files $uri $uri/ /index.html;' >> /etc/nginx/conf.d/default.conf && \
+              echo '    }' >> /etc/nginx/conf.d/default.conf && \
+              echo '}' >> /etc/nginx/conf.d/default.conf
+          
           COPY --from=build /app/dist /usr/share/nginx/html
           EXPOSE 80
-          CMD ["nginx","-g","daemon off;"]
+          CMD ["nginx", "-g", "daemon off;"]
           EOF
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
           context: ./upstream
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: |
             ${{ env.IMAGE_NAME }}:latest
-            ${{ env.IMAGE_NAME }}:upstream-${{ steps.upstream_sha.outputs.sha }}
+            ${{ env.IMAGE_NAME }}:upstream-${{ steps.upstream_info.outputs.sha }}
+            ${{ env.IMAGE_NAME }}:${{ steps.upstream_info.outputs.date }}
+          labels: |
+            org.opencontainers.image.title=syncribullet
+            org.opencontainers.image.description=Stremio addon for syncing currently watched items
+            org.opencontainers.image.source=https://github.com/aliyss/syncribullet
+            org.opencontainers.image.revision=${{ steps.upstream_info.outputs.full_sha }}
+            org.opencontainers.image.created=${{ steps.upstream_info.outputs.isodate }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           provenance: false
+          sbom: false
